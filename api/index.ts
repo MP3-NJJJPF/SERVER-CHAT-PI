@@ -167,31 +167,38 @@ io.on("connection", (socket: Socket) => {
      * Handles incoming chat messages from clients and broadcasts them to all users.
      */
     socket.on("chat:message", (payload: ChatMessagePayload) => {
-        // Remove leading and trailing whitespace from the message
         const trimmedMessage = payload?.message?.trim();
-
-        // Prevent empty messages from being broadcast
         if (!trimmedMessage) return;
 
-        // Find who sent the message based on their socket ID
-        const sender = onlineUsers.find(user => user.socketId === socket.id) ?? null;
+        let sender = null;
+        let senderRoomId = null;
 
-        // Build the final message object to be sent to all clients
+        // Buscar al usuario Y su sala
+        for (const rid in onlineUsersByRoom) {
+            const found = onlineUsersByRoom[rid].find(
+                (u) => u.socketId === socket.id
+            );
+
+            if (found) {
+                sender = found;
+                senderRoomId = rid; // ⬅️ AQUI GUARDAMOS LA SALA
+                break;
+            }
+        }
+
         const outgoingMessage = {
-            userId: payload.userId || sender?.userId || socket.id,
+            userId: payload.userId,
             message: trimmedMessage,
-            timestamp: payload.timestamp ?? new Date().toISOString()
+            timestamp: payload.timestamp ?? new Date().toISOString(),
+            name: sender?.name ?? null,
+            photo: sender?.photo ?? null,
         };
 
-        // Broadcast the message to all connected clients
-        io.emit("chat:message", outgoingMessage);
+        if (senderRoomId) {
+            io.to(senderRoomId).emit("chat:message", outgoingMessage);
+        }
 
-        console.log(
-            "Relayed chat message from: ",
-            outgoingMessage.userId,
-            " message: ",
-            outgoingMessage.message
-        );
+        console.log("Relayed chat:", outgoingMessage);
     });
 
     /**
