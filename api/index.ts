@@ -1,59 +1,234 @@
-import express from "express";
-import cors from "cors";
+import { Server, type Socket } from "socket.io";
 import "dotenv/config";
-// import db from "./config/database";
-// import routes from "./routes/routes";
-// import cookieParser from 'cookie-parser';
-
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+import { apiClient } from "./fetch/fetchClient.js";
 
 /**
- * Middleware configuration
- * - Parse JSON request bodies
- * - Parse URL-encoded request bodies
- * - Enable Cross-Origin Resource Sharing (CORS)
+ * Loads allowed CORS origins from the ORIGIN environment variable.
+ * ORIGIN can contain multiple origins separated by commas.
+ * Example: ORIGIN="http://localhost:5173, https://mywebsite.com"
  */
-const allowedOrigins = process.env.ORIGIN?.split(",").map(s => s.trim()).filter(Boolean);
-app.use(
-  // allowedOrigins && allowedOrigins.length > 0
-  //   ? cors({ origin: allowedOrigins })
-  //   : cors() 
-  cors({ 
-    origin: allowedOrigins, // Permitir localhost y el dominio de producción
-    credentials: true // Permitir el envío de cookies
-}));
-
-// Permitir el envío de cookies
-// app.use(cookieParser());
+const origins = (process.env.ORIGIN ?? "")
+    .split(",")              // Split by commas
+    .map(s => s.trim())      // Remove extra whitespace
+    .filter(Boolean);        // Remove empty strings
 
 /**
- * Initialize database connection.
- * Exits the process if the connection fails.
+ * Initializes the Socket.io server with CORS configuration.
  */
-//db.connectDB();
+const io = new Server({
+    cors: {
+        origin: origins
+    }
+});
+
+const port = Number(process.env.PORT);
 
 /**
- * Mount the API routes.
- * All feature routes are grouped under `/api/v1`.
+ * Starts the server on the specified port.
  */
-//app.use("/api/v1", routes);
+io.listen(port);
+console.log(`Server is running on port ${port}`);
 
 /**
- * Health check endpoint.
- * Useful to verify that the server is up and running.
+ * Useful types for managing connected users and chat messages
  */
-//app.get("/", (req, res) => res.send("Server is running"));
+type OnlineUser = { socketId: string; userId: string, name?: string; photo?: string; };
+type ChatMessagePayload = {
+    userId: string;
+    message: string;
+    timestamp?: string;
+};
 
 /**
- * Start the server only if this file is run directly
- * (prevents multiple servers when testing with imports).
+ * In-memory storage of online users organized by room.
+ * Each room has its own array of connected users with their socket and user information.
  */
-if (require.main === module) {
-    const PORT = process.env.PORT || 3000;
+const onlineUsersByRoom: Record<string, {
+    socketId: string;
+    userId: string;
+    name: string;
+    photo: string;
+}[]> = {};
 
-    app.listen(PORT, () => {
-        console.log(`Server running on http://localhost:${PORT}`);
+/**
+ * In-memory list of connected users.
+ * Each entry represents an individual socket connection.
+ */
+let onlineUsers: OnlineUser[] = [];
+
+/**
+ * Main event: "connection"
+ * Executes every time a client connects to the WebSocket server.
+ */
+io.on("connection", (socket: Socket) => {
+    /**
+     * Event: "newUser"
+     * Handles when a user joins a meeting room.
+     * Manages user registration, reconnections, and multi-tab scenarios.
+     */
+    socket.on("newUser", async (userData) => {
+        const { userId, name, photo, roomId } = userData;
+
+        // Prevent invalid data from being processed
+        if (!userId || !roomId) return;
+
+        // Create the room if it doesn't exist yet
+        if (!onlineUsersByRoom[roomId]) {
+            onlineUsersByRoom[roomId] = [];
+        }
+
+        // Get the list of users ONLY for this specific room
+        let users = onlineUsersByRoom[roomId];
+
+        // Check if this socket is already registered in the room
+        const existingUserIndex = users.findIndex(
+            user => user.socketId === socket.id
+        );
+
+        if (existingUserIndex !== -1) {
+            // Case 1: Socket already exists in the room
+            // Update the existing entry with new user data (userId, name, photo)
+            users[existingUserIndex] = {
+                socketId: socket.id,
+                userId,
+                name,
+                photo
+            };
+
+        } else if (!users.some(user => user.userId === userId)) {
+            // Case 2: This userId doesn't exist in the room yet
+            // Add them as a new user to the room
+            users.push({
+                socketId: socket.id,
+                userId,
+                name,
+                photo
+            });
+
+            // Notify the backend to add this participant to the meeting
+            await apiClient.post(`/api/v1/meetings/add-participant`, { meetingId: roomId, userId: userId, name: name });
+        } else {
+            // Case 3: UserId already exists but with a different socket
+            // This happens when:
+            // - User opened another tab
+            // - User reloaded the page
+            // - User reconnected due to poor network connection
+            // Update their socket ID to the new one
+            users = users.map(user =>
+                user.userId === userId
+                    ? { socketId: socket.id, userId, name, photo }
+                    : user
+            );
+
+            onlineUsersByRoom[roomId] = users;
+        }
+
+        // Join the socket to the correct room
+        socket.join(roomId);
+
+        // Notify ONLY the users in this specific room about the updated user list
+        io.to(roomId).emit("usersOnline", onlineUsersByRoom[roomId]);
     });
-}
+
+    /**
+     * Event: "disconnect"
+     * Executes when a client disconnects from the server.
+     * Removes the user from all rooms they were part of and notifies remaining users.
+     */
+    socket.on("disconnect", async () => {
+        // Iterate through all rooms to find and remove the disconnected user
+        for (const roomId in onlineUsersByRoom) {
+            // Find the user to remove based on their socket ID
+            const userToRemove = onlineUsersByRoom[roomId].find(
+                u => u.socketId === socket.id
+            );
+            // Store the count before removal for comparison
+            const before = onlineUsersByRoom[roomId].length;
+
+            // Remove the user from the room's user list
+            onlineUsersByRoom[roomId] = onlineUsersByRoom[roomId].filter(
+                u => u.socketId !== socket.id
+            );
+
+            // Check if a user was actually removed (count changed)
+            if (before !== onlineUsersByRoom[roomId].length) {
+                // If we found the user, notify the backend to remove them from the meeting
+                if (userToRemove) {
+                    await apiClient.post(`/api/v1/meetings/remove-participant`, { meetingId: roomId, userId: userToRemove.userId, name: userToRemove.name });
+                }
+                // Notify only the users in this room about the updated user list
+                io.to(roomId).emit("usersOnline", onlineUsersByRoom[roomId]);
+            }
+        }
+    });
+
+    /**
+     * Event: "chat:message"
+     * Handles incoming chat messages from clients and broadcasts them to all users.
+     */
+    socket.on("chat:message", (payload: ChatMessagePayload) => {
+        // Remove leading and trailing whitespace from the message
+        const trimmedMessage = payload?.message?.trim();
+
+        // Prevent empty messages from being broadcast
+        if (!trimmedMessage) return;
+
+        // Find who sent the message based on their socket ID
+        const sender = onlineUsers.find(user => user.socketId === socket.id) ?? null;
+
+        // Build the final message object to be sent to all clients
+        const outgoingMessage = {
+            userId: payload.userId || sender?.userId || socket.id,
+            message: trimmedMessage,
+            timestamp: payload.timestamp ?? new Date().toISOString()
+        };
+
+        // Broadcast the message to all connected clients
+        io.emit("chat:message", outgoingMessage);
+
+        console.log(
+            "Relayed chat message from: ",
+            outgoingMessage.userId,
+            " message: ",
+            outgoingMessage.message
+        );
+    });
+
+    /**
+     * Event: "leave-call"
+     * Handles when a user explicitly leaves a call/meeting.
+     * Removes them from the room and notifies the backend and other participants.
+     */
+    socket.on("leave-call", async ({ roomId }) => {
+        // Exit early if no room ID is provided
+        if (!roomId) return;
+
+        // Get the users in this specific room
+        const users = onlineUsersByRoom[roomId];
+        if (!users) return;
+
+        // Find the user who is leaving based on their socket ID
+        const userToRemove = users.find(u => u.socketId === socket.id);
+
+        // Remove the user from the room's user list
+        onlineUsersByRoom[roomId] = users.filter(
+            u => u.socketId !== socket.id
+        );
+
+        // If a user was actually found and removed, update the backend
+        if (userToRemove) {
+            await apiClient.post(`/api/v1/meetings/remove-participant`, {
+                meetingId: roomId,
+                userId: userToRemove.userId,
+                name: userToRemove.name,
+            });
+            console.log("User", userToRemove.userId)
+        }
+
+        // Remove the socket from the Socket.io room
+        socket.leave(roomId);
+
+        // Notify ONLY the users in this room about the updated user list
+        io.to(roomId).emit("usersOnline", onlineUsersByRoom[roomId]);
+    });
+});
